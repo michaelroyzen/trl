@@ -194,6 +194,9 @@ class ScriptArguments:
         enable_prefix_caching (`bool`, *optional*):
             Whether to enable prefix caching in vLLM. If set to `True`, ensure that the model and the hardware support
             this feature.
+        enable_expert_parallel (`bool`, *optional*):
+            Whether to enable expert parallelism in vLLM for MoE models. If set to `True`, experts will be distributed
+            across tensor parallel workers.
         enforce_eager (`bool`, *optional*, defaults to `False`):
             Whether to enforce eager execution. If set to `True`, we will disable CUDA graph and always execute the
             model in eager mode. If `False` (default behavior), we will use CUDA graph and eager execution in hybrid.
@@ -206,9 +209,14 @@ class ScriptArguments:
         trust_remote_code (`bool`, *optional*, defaults to `False`):
             Whether to trust remote code when loading models. Set to `True` to allow executing code from model
             repositories. This is required for some custom models but introduces security risks.
+        language_model_only (`bool`, *optional*, defaults to `False`):
+            Whether to force vLLM to load the model in language-model-only mode.
         log_level (`str`, *optional*, defaults to `"info"`):
             Log level for uvicorn. Possible choices: `"critical"`, `"error"`, `"warning"`, `"info"`, `"debug"`,
             `"trace"`.
+        limit_mm_per_prompt (`str`, *optional*):
+            Limits on multimodal items per prompt, as comma-separated key=value pairs (e.g., `"image=0,video=0"`).
+            Passed through to vLLM's EngineArgs to restrict the number of multimodal inputs.
     """
 
     model: str = field(
@@ -269,6 +277,13 @@ class ScriptArguments:
             "hardware support this feature."
         },
     )
+    enable_expert_parallel: bool | None = field(
+        default=None,
+        metadata={
+            "help": "Whether to enable expert parallelism in vLLM for MoE models. If set to `True`, experts will "
+            "be distributed across tensor parallel workers."
+        },
+    )
     enforce_eager: bool | None = field(
         default=False,
         metadata={
@@ -290,6 +305,10 @@ class ScriptArguments:
             "repositories. This is required for some custom models but introduces security risks."
         },
     )
+    language_model_only: bool = field(
+        default=False,
+        metadata={"help": "Whether to force vLLM to load the model in language-model-only mode."},
+    )
     log_level: str = field(
         default="info",
         metadata={
@@ -305,6 +324,13 @@ class ScriptArguments:
             "model implementation."
         },
     )
+    limit_mm_per_prompt: str | None = field(
+        default=None,
+        metadata={
+            "help": "Limits on multimodal items per prompt, as comma-separated key=value pairs "
+            "(e.g., 'image=0,video=0'). Passed through to vLLM's EngineArgs."
+        },
+    )
 
 
 def llm_worker(
@@ -318,6 +344,13 @@ def llm_worker(
     os.environ["VLLM_DP_SIZE"] = str(script_args.data_parallel_size)
     os.environ["VLLM_DP_MASTER_PORT"] = str(master_port)
 
+    limit_mm_per_prompt = None
+    if script_args.limit_mm_per_prompt:
+        limit_mm_per_prompt = {}
+        for item in script_args.limit_mm_per_prompt.split(","):
+            key, value = item.split("=")
+            limit_mm_per_prompt[key.strip()] = int(value.strip())
+
     llm = LLM(
         model=script_args.model,
         revision=script_args.revision,
@@ -329,11 +362,14 @@ def llm_worker(
         # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
         # This is particularly useful here because we generate completions from the same prompts.
         enable_prefix_caching=script_args.enable_prefix_caching,
+        enable_expert_parallel=script_args.enable_expert_parallel,
         kv_cache_dtype=script_args.kv_cache_dtype,
         max_model_len=script_args.max_model_len,
         worker_extension_cls="trl.scripts.vllm_serve.WeightSyncWorkerExtension",
         trust_remote_code=script_args.trust_remote_code,
         model_impl=script_args.vllm_model_impl,
+        language_model_only=script_args.language_model_only,
+        limit_mm_per_prompt=limit_mm_per_prompt,
         # Important so temperature scaling/logit tweaking affects the TIS log probs
         logprobs_mode="processed_logprobs",
     )
