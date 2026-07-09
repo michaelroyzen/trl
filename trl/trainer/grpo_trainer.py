@@ -2011,6 +2011,14 @@ class GRPOTrainer(_BaseTrainer):
 
         # Apply tool_mask (from env_mask) for loss computation in multi-turn training scenarios
         loss_mask = completion_mask if "tool_mask" not in inputs else completion_mask * inputs["tool_mask"]
+        # For dapo/cispo, match the torch path (_compute_loss): normalize by the total active tokens
+        # across the entire generation batch (num_items_in_batch / num_processes) instead of the
+        # current micro-batch's mask sum. Liger's kernel applies the num_items_in_batch / world_size
+        # normalizer internally when it is provided.
+        global_normalizer_loss_types = ["dapo", "cispo"]
+        num_items_in_batch = (
+            inputs.get("num_items_in_batch") if self.loss_type in global_normalizer_loss_types else None
+        )
         loss, metrics = triton_grpo_loss(
             model(**model_inputs).logits,
             inputs.get("old_per_token_logps"),
@@ -2032,6 +2040,7 @@ class GRPOTrainer(_BaseTrainer):
             sapo_temperature_neg=self.args.sapo_temperature_neg,
             delta=self.args.delta,
             use_bias_correction_kl=self.args.use_bias_correction_kl,
+            num_items_in_batch=num_items_in_batch,
         )
 
         mode = "train" if self.model.training else "eval"
@@ -2042,6 +2051,10 @@ class GRPOTrainer(_BaseTrainer):
             metric_offset = 1
         clip_ratio = metrics[metric_offset]
         self._metrics[mode]["clip_ratio"].append(self.accelerator.gather(clip_ratio).mean().item())
+        if num_items_in_batch is not None:
+            # Loss is already normalized by the global token count, so micro-batch losses must sum
+            # across gradient-accumulation steps (the torch path likewise skips the accum divisor).
+            return loss
         normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0  # no accum in eval
         return loss / normalizer
 
