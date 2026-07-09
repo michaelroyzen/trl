@@ -68,7 +68,7 @@ from ..extras.profiling import profiling_context, profiling_decorator
 from ..generation.vllm_generation import VLLMGeneration
 from ..import_utils import is_jmespath_available, is_liger_kernel_available
 from ..models import prepare_deepspeed, prepare_fsdp, unwrap_model_for_generation
-from ..models.utils import disable_gradient_checkpointing
+from ..models.utils import _ForwardRedirection, disable_gradient_checkpointing
 from .base_trainer import _BaseTrainer
 from .callbacks import SyncRefModelCallback
 from .grpo_config import GRPOConfig
@@ -100,6 +100,11 @@ if is_peft_available():
 
 if is_liger_kernel_available():
     from liger_kernel.transformers.grpo_loss import triton_grpo_loss
+
+    try:
+        from liger_kernel.transformers.chunked_grpo_loss import chunked_triton_grpo_loss
+    except ImportError:  # Liger build without the chunked Triton GRPO loss
+        chunked_triton_grpo_loss = None
 
 
 if is_wandb_available():
@@ -673,6 +678,24 @@ class GRPOTrainer(_BaseTrainer):
                 raise ImportError(
                     "Liger is required to use `use_liger_kernel` as the GRPO loss. Run `pip install liger-kernel`."
                 )
+        self.use_liger_chunked_loss = self.use_liger_kernel and args.use_liger_chunked_loss
+        if self.use_liger_chunked_loss:
+            if chunked_triton_grpo_loss is None:
+                raise ImportError(
+                    "`use_liger_chunked_loss=True` requires a liger-kernel build that provides "
+                    "`liger_kernel.transformers.chunked_grpo_loss`. Upgrade liger-kernel or set "
+                    "`use_liger_chunked_loss=False` to use the non-chunked Triton loss."
+                )
+            if args.cast_lm_head_to_fp32:
+                raise ValueError(
+                    "`use_liger_chunked_loss=True` is incompatible with `cast_lm_head_to_fp32=True`: the chunked "
+                    "loss consumes lm_head.weight directly and requires it in the hidden-state dtype. Set "
+                    "`use_liger_chunked_loss=False`."
+                )
+            # The chunked loss reads lm_head.weight outside lm_head.forward(). Route the whole loss
+            # computation through the wrapper's forward (DeepSpeed engine / DDP) so that ZeRO-3's
+            # automatic external-parameter handling gathers the weight and reduce-scatters its grad.
+            self._liger_forward_redirection = _ForwardRedirection()
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
@@ -911,6 +934,51 @@ class GRPOTrainer(_BaseTrainer):
             mini_repeat_count=self.num_generations_eval,
             seed=self.args.seed,
         )
+
+    @profiling_decorator
+    def _get_last_hidden_state(
+        self,
+        unwrapped_model,
+        input_ids,
+        attention_mask,
+        logits_to_keep,
+        pixel_values=None,
+        image_grid_thw=None,
+        pixel_attention_mask=None,
+        image_sizes=None,
+    ):
+        if is_peft_model(unwrapped_model):
+            unwrapped_model = unwrapped_model.base_model.model
+
+        # Build model inputs - check if the model supports logits_to_keep (some models and VLMs don't)
+        model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
+
+        # For Qwen models:
+        if image_grid_thw is not None and pixel_values is not None:
+            model_inputs["image_grid_thw"] = image_grid_thw
+        # For Gemma, SmolVLM2, LLaVa-Next etc.:
+        if pixel_values is not None:
+            model_inputs["pixel_values"] = pixel_values
+        # For SmolVLM2
+        if pixel_attention_mask is not None:
+            model_inputs["pixel_attention_mask"] = pixel_attention_mask
+        # For LLaVa-Next
+        if image_sizes is not None:
+            model_inputs["image_sizes"] = image_sizes
+
+        # Only add logits_to_keep if the model supports it
+        if "logits_to_keep" in self.model_kwarg_keys:
+            # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
+            model_inputs["logits_to_keep"] = logits_to_keep + 1
+
+        model_inputs["use_cache"] = False  # only used in generation; set False to suppress warnings
+
+        last_hidden_state = unwrapped_model.model(**model_inputs).last_hidden_state
+        # Exclude the last value: it corresponds to the next token pred
+        last_hidden_state = last_hidden_state[:, :-1, :]  # (B, L-1, H)
+        # Only keep the last logits_to_keep. For model that support logits_to_keep, this is a no-op.
+        last_hidden_state = last_hidden_state[:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
+        return last_hidden_state
 
     def get_high_entropy_mask(self, entropies: torch.Tensor, mask: torch.Tensor, threshold: float) -> torch.Tensor:
         """
@@ -2058,11 +2126,106 @@ class GRPOTrainer(_BaseTrainer):
         normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0  # no accum in eval
         return loss / normalizer
 
+    def compute_chunked_liger_loss(self, unwrapped_model, inputs):
+        """Chunked Triton GRPO loss: fuses the lm_head projection into the loss so the
+        (B, L, vocab) logits tensor is never materialized.
+
+        Sharding contract: ZeRO-3/FSDP manage parameter lifetime per *module* window (gather at
+        the owning module's forward, re-gather for its backward, reduce-scatter its grad). The
+        fused loss consumes `lm_head.weight` as a raw GEMM operand and saves it for backward, so
+        the call below is redirected through `lm_head`'s own forward: from the wrapper's
+        perspective the chunked loss is then an ordinary lm_head invocation (module in,
+        activations out) whose backward window covers the fused Function's backward — the same
+        contract the non-chunked path gets from the real lm_head matmul. This method itself is
+        additionally invoked through the top-level forward redirection (see `compute_loss`) so
+        the base-model call also runs inside the wrapper's forward scope.
+        """
+        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
+        completion_ids = inputs["completion_ids"].contiguous()
+        completion_mask = inputs["completion_mask"].contiguous()
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)
+
+        last_hidden_state = self._get_last_hidden_state(
+            unwrapped_model,
+            input_ids,
+            attention_mask,
+            logits_to_keep,
+            inputs.get("pixel_values"),
+            inputs.get("image_grid_thw"),
+            inputs.get("pixel_attention_mask"),
+            inputs.get("image_sizes"),
+        )
+
+        lm_head = unwrapped_model.lm_head
+        if lm_head.bias is not None:
+            raise NotImplementedError(
+                "`use_liger_chunked_loss=True` does not support models with an lm_head bias. Set "
+                "`use_liger_chunked_loss=False` to use the non-chunked Triton loss."
+            )
+
+        # Apply tool_mask (from env_mask) for loss computation in multi-turn training scenarios
+        loss_mask = completion_mask if "tool_mask" not in inputs else completion_mask * inputs["tool_mask"]
+        # Same global dapo/cispo normalization as compute_liger_loss (matches the torch path).
+        global_normalizer_loss_types = ["dapo", "cispo"]
+        num_items_in_batch = (
+            inputs.get("num_items_in_batch") if self.loss_type in global_normalizer_loss_types else None
+        )
+        # Inner redirection: run the fused loss as lm_head's forward so the sharding wrapper
+        # opens a gather/backward window for lm_head.weight around it (see docstring).
+        loss, metrics = self._liger_forward_redirection(
+            lm_head,
+            lm_head,
+            chunked_triton_grpo_loss,
+            last_hidden_state.contiguous(),
+            lm_head.weight,
+            inputs.get("old_per_token_logps"),
+            inputs.get("ref_per_token_logps"),
+            completion_ids,
+            inputs["advantages"],
+            completion_mask=loss_mask,
+            temperature=self.temperature,
+            beta=self.beta,
+            eps_low=self.epsilon_low,
+            eps_high=self.epsilon_high,
+            loss_type=self.loss_type,
+            max_completion_length=self.max_completion_length,
+            importance_sampling_level=self.importance_sampling_level,
+            reduce=True,
+            vllm_is_ratio=inputs.get("importance_sampling_ratio"),
+            sapo_temperature_pos=self.args.sapo_temperature_pos,
+            sapo_temperature_neg=self.args.sapo_temperature_neg,
+            delta=self.args.delta,
+            use_bias_correction_kl=self.args.use_bias_correction_kl,
+            num_items_in_batch=num_items_in_batch,
+        )
+
+        mode = "train" if self.model.training else "eval"
+        metric_offset = 0
+        if self.beta != 0.0:
+            kl_metric = metrics[0]
+            self._metrics[mode]["kl"].append(self.accelerator.gather(kl_metric).mean().item())
+            metric_offset = 1
+        clip_ratio = metrics[metric_offset]
+        self._metrics[mode]["clip_ratio"].append(self.accelerator.gather(clip_ratio).mean().item())
+        if num_items_in_batch is not None:
+            # Loss is already normalized by the global token count, so micro-batch losses must sum
+            # across gradient-accumulation steps (the torch path likewise skips the accum divisor).
+            return loss
+        normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0  # no accum in eval
+        return loss / normalizer
+
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
         if self.use_liger_kernel:
+            if self.use_liger_chunked_loss:
+                unwrapped_model = self.accelerator.unwrap_model(model)
+                return self._liger_forward_redirection(
+                    model, unwrapped_model, self.compute_chunked_liger_loss, unwrapped_model, inputs
+                )
             return self.compute_liger_loss(model, inputs)
         else:
             return self._compute_loss(model, inputs)
