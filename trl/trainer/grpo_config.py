@@ -266,12 +266,13 @@ class GRPOConfig(_BaseConfig):
             position, improving results. Range: `[0.0-1.0]`. A value of `0.0` masks all but the highest entropy token;
             `1.0` keeps all tokens. The paper recommends a value of `0.2`. If used with
             `mask_truncated_completions=True`, only tokens from non-truncated completions are considered.
-        use_liger_chunked_loss (`bool`, *optional*, defaults to `True`):
-            Only used when `use_liger_kernel` is `True`. If `True` (default), use Liger's chunked Triton GRPO loss,
-            which fuses the lm_head projection into the loss so the (B, L, vocab) logits tensor is never
-            materialized (flat loss-stage memory at any context length). If `False`, use Liger's non-chunked Triton
-            loss on materialized logits (faster at short contexts, O(logits) memory). The chunked path requires a
-            Liger build with `liger_kernel.transformers.chunked_grpo_loss` and a model whose lm_head has no bias.
+        use_liger_chunked_loss (`bool`, *optional*, defaults to `False`):
+            Only used when `use_liger_kernel` is `True`. If `True`, use Liger's chunked Triton GRPO loss, which
+            fuses the lm_head projection into the loss so the (B, L, vocab) logits tensor is never materialized
+            (flat loss-stage memory at any context length). If `False` (default), use Liger's non-chunked Triton
+            loss on materialized logits (faster, O(logits) memory — preferable while completion lengths keep the
+            logits tensor small relative to the model's activation footprint). The chunked path requires a Liger
+            build with `liger_kernel.transformers.chunked_grpo_loss` and a model whose lm_head has no bias.
         max_tool_calling_iterations (`int`, *optional*):
             Maximum number of tool-calling turns when training an agent. If `None`, there is no limit and generation
             stops when the model generates a response turn with no tool calls or when the total response length reaches
@@ -739,14 +740,14 @@ class GRPOConfig(_BaseConfig):
         },
     )
     use_liger_chunked_loss: bool = field(
-        default=True,
+        default=False,
         metadata={
-            "help": "Only used when `use_liger_kernel` is `True`. If `True` (default), use Liger's chunked Triton "
-            "GRPO loss, which fuses the lm_head projection into the loss so the (B, L, vocab) logits tensor is "
-            "never materialized (flat ~5 GiB loss-stage memory at any context length). If `False`, use Liger's "
-            "non-chunked Triton loss on materialized logits (faster at short contexts, O(logits) memory). The "
-            "chunked path requires a Liger build with `liger_kernel.transformers.chunked_grpo_loss` and a model "
-            "whose lm_head has no bias."
+            "help": "Only used when `use_liger_kernel` is `True`. If `True`, use Liger's chunked Triton GRPO "
+            "loss, which fuses the lm_head projection into the loss so the (B, L, vocab) logits tensor is never "
+            "materialized (flat ~5 GiB loss-stage memory at any context length). If `False` (default), use "
+            "Liger's non-chunked Triton loss on materialized logits (faster, O(logits) memory). The chunked path "
+            "requires a Liger build with `liger_kernel.transformers.chunked_grpo_loss` and a model whose lm_head "
+            "has no bias."
         },
     )
     max_tool_calling_iterations: int | None = field(
