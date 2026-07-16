@@ -104,8 +104,12 @@ if TYPE_CHECKING:
     from peft import PeftModel
 
 
-if is_bitsandbytes_available():
-    import bitsandbytes as bnb
+# NOTE: bitsandbytes is intentionally NOT imported at module scope. Importing it
+# initializes CUDA (observed on bitsandbytes 0.49.x), and `trl vllm-serve` imports
+# this module in the parent server process BEFORE forking its per-DP-rank llm_worker
+# processes - a CUDA context in the parent makes every forked worker die with
+# "Cannot re-initialize CUDA in forked subprocess" followed by a segfault. The only
+# consumer (colocate-mode quantization detection) imports it lazily instead.
 
 
 # vLLM loads these checkpoints by their top-level `architectures` entry as the full
@@ -394,6 +398,8 @@ class VLLMGeneration:
 
             quantization = None
             if is_bitsandbytes_available():
+                import bitsandbytes as bnb  # deferred: importing bnb initializes CUDA
+
                 for _, module in model.named_modules():
                     if isinstance(module, bnb.nn.Linear4bit):
                         quantization = "bitsandbytes"
