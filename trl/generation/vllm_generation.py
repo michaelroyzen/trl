@@ -346,6 +346,12 @@ class VLLMGeneration:
         # while the trainer holds the text-only inner model (e.g. Qwen3.5 / Qwen3-VL).
         self._vllm_param_prefix = get_vllm_param_prefix(model)
 
+        # Set of original-checkpoint fp8 weight keys when the SERVER holds a quantized
+        # model and the trainer holds its bf16 dequant (e.g. DeepSeek-V3.2). None means
+        # plain bf16 sync. Resolved lazily on the first sync (server must be reachable).
+        self._fp8_sync_keys: set[str] | None = None
+        self._fp8_sync_resolved = False
+
         self._init_vllm()
 
     def _init_vllm(self):
@@ -447,11 +453,59 @@ class VLLMGeneration:
         return name
 
     def _push_param_to_vllm(self, name: str, param) -> None:
-        """Push a single parameter tensor to the vLLM engine (server or colocate mode)."""
+        """Push a single parameter tensor to the vLLM engine (server or colocate mode).
+
+        When the server holds a quantized (fp8) model, quantizable tensors are converted
+        to checkpoint format client-side - e4m3 weight plus per-128x128-block ue8m0
+        `weight_scale_inv` - and sent as a pair; the server loads them through vLLM's
+        layerwise reload (see `sync_weights`). This also halves the wire bytes.
+        """
         if self.mode == "server" and self.accelerator.is_main_process:
-            self.vllm_client.update_named_param(name, param)
+            if self._fp8_sync_keys is not None and self._is_fp8_synced_param(name):
+                for wire_name, tensor in self._quantize_param_for_sync(name, param):
+                    self.vllm_client.update_named_param(wire_name, tensor)
+            else:
+                self.vllm_client.update_named_param(name, param)
         elif self.mode == "colocate":
             self.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights([(name, param)])
+
+    def _is_fp8_synced_param(self, name: str) -> bool:
+        """True if this trainer parameter is fp8-quantized on the serving side.
+
+        The manifest holds original-checkpoint weight keys (the ones that shipped with
+        `_scale_inv` scales). Dense params match directly; packed 3D expert params
+        (`...experts.gate_up_proj`, no `.weight` suffix) match via their per-expert form.
+        """
+        if name in self._fp8_sync_keys:
+            return True
+        if name.endswith((".experts.gate_up_proj", ".experts.down_proj")):
+            base, proj = name.rsplit(".", 1)
+            probe = "gate_proj" if proj == "gate_up_proj" else "down_proj"
+            return f"{base}.0.{probe}.weight" in self._fp8_sync_keys
+        return False
+
+    def _quantize_param_for_sync(self, name: str, param) -> list[tuple[str, "torch.Tensor"]]:
+        """Quantize a bf16 tensor to checkpoint-format fp8 + block scales.
+
+        Returns [(name, fp8_weight), (scale_name, scales_f32)]. Packed 3D expert tensors
+        are quantized per expert slice (each expert is an independent 2D weight with its
+        own 128x128 block grid, matching the original checkpoint's per-expert scales).
+        """
+        # Pure-torch path inside vLLM; ue8m0 gives power-of-two scales like the original
+        # DeepSeek checkpoints, so dequantization on the serving side is exact in fp32.
+        from vllm.utils.deep_gemm import per_block_cast_to_fp8
+
+        data = param.detach()
+        if data.dim() == 2:
+            weight_q, scales = per_block_cast_to_fp8(data, [128, 128], use_ue8m0=True)
+            scale_name = name.removesuffix(".weight") + ".weight_scale_inv"
+            return [(name, weight_q), (scale_name, scales.to(torch.float32))]
+        if data.dim() == 3:
+            quantized = [per_block_cast_to_fp8(expert, [128, 128], use_ue8m0=True) for expert in data]
+            weight_q = torch.stack([w for w, _ in quantized])
+            scales = torch.stack([s for _, s in quantized]).to(torch.float32)
+            return [(name, weight_q), (f"{name}_scale_inv", scales)]
+        raise ValueError(f"Cannot fp8-quantize parameter '{name}' with {data.dim()} dims for sync.")
 
     def _sync_fsdp1_params_to_vllm(self, module: nn.Module, prefix: str = "", visited: set[str] | None = None):
         """Memory-efficient post-order traversal of FSDP modules to extract full parameters and sync with vLLM."""
@@ -503,6 +557,45 @@ class VLLMGeneration:
         elif self._dist.fsdp_version == 2:
             self._sync_fsdp2_params_to_vllm(model)
 
+    def _resolve_fp8_sync(self) -> None:
+        """Detect a quantized (fp8) server and load the fp8 sync manifest once.
+
+        The manifest (`fp8_sync_manifest.json`, written next to the bf16 dequant
+        checkpoint by the monorepo's dequantize_fp8_checkpoint.py) lists the original
+        checkpoint's fp8 weight keys, i.e. exactly the tensors that must be re-quantized
+        to e4m3 + block scales on every sync. Everything else ships as-is.
+        """
+        if self._fp8_sync_resolved:
+            return
+        self._fp8_sync_resolved = True
+        if self.mode != "server" or not self.accelerator.is_main_process:
+            return
+        quantization = self.vllm_client.get_server_quantization()
+        if quantization is None:
+            return
+        if quantization != "fp8":
+            raise NotImplementedError(
+                f"Weight sync to a '{quantization}'-quantized vLLM server is not supported "
+                "(only fp8 block quantization is implemented)."
+            )
+        import json
+        from pathlib import Path
+
+        manifest_path = Path(self.model.name_or_path) / "fp8_sync_manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"The vLLM server holds an fp8-quantized model but the trainer checkpoint has no "
+                f"fp8 sync manifest at {manifest_path}. Generate the bf16 trainer checkpoint with "
+                "dequantize_fp8_checkpoint.py (which writes the manifest), or add the manifest: "
+                'a JSON {"fp8_weight_keys": [<original checkpoint keys that had _scale_inv>]}.'
+            )
+        self._fp8_sync_keys = set(json.loads(manifest_path.read_text())["fp8_weight_keys"])
+        logger.info(
+            "fp8 weight sync enabled: %d quantized weight keys; syncs run as layerwise "
+            "checkpoint-format rounds.",
+            len(self._fp8_sync_keys),
+        )
+
     def sync_weights(self):
         """Synchronize model weights to vLLM.
 
@@ -517,6 +610,14 @@ class VLLMGeneration:
 
         model = self.model
         accelerator = self.accelerator
+
+        # Quantized (fp8) servers take the whole round as a layerwise checkpoint-format
+        # update: parameters revert to checkpoint layout while weights stream in, and
+        # end_weight_update() re-runs the per-layer quantization kernel-format processing.
+        self._resolve_fp8_sync()
+        layerwise_round = self._fp8_sync_keys is not None and accelerator.is_main_process
+        if layerwise_round:
+            self.vllm_client.begin_weight_update()
 
         if is_peft_model(model):
             # With PEFT and FSDP/DeepSpeed ZeRO Stage 3, we must gather the full model at once before merging, as
@@ -555,6 +656,9 @@ class VLLMGeneration:
                     name = self._fix_param_name_to_vllm(name)
                     with self._dist.gather_params([param]):
                         self._push_param_to_vllm(name, param.data)
+
+        if layerwise_round:
+            self.vllm_client.end_weight_update()
 
         # Reset cache on vLLM
         if self.mode == "server" and accelerator.is_main_process:

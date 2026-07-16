@@ -51,6 +51,17 @@ class WeightSyncWorkerExtension:
     # Fused (packed 3D) MoE expert tensors, e.g. `...mlp.experts.gate_up_proj` for Qwen3.5-MoE.
     _FUSED_EXPERT_WEIGHT_RE = re.compile(r"(?P<module>.+\.experts)\.(?P<proj>gate_up_proj|down_proj)$")
 
+    # Packed expert tensors including block-scale companions, used only during layerwise
+    # (quantized) weight-update rounds, e.g. `...mlp.experts.gate_up_proj_scale_inv`.
+    _PACKED_EXPERT_ANY_RE = re.compile(
+        r"(?P<module>.+\.experts)\.(?P<proj>gate_up_proj|down_proj)(?P<scale>_scale_inv)?$"
+    )
+
+    # True between begin_weight_update() and end_weight_update() on quantized models:
+    # parameters are restored to checkpoint layout and weight loaders are wrapped by
+    # vLLM's layerwise reload machinery, so the kernel-format staging path must not run.
+    _layerwise_update_active = False
+
     # Unquantized MoE backends whose kernel-format conversion is validated to be an independent,
     # per-tensor transformation of w13 and w2 (see `_update_fused_expert_param`). AITER (ROCm) is
     # deliberately excluded until validated.
@@ -60,6 +71,7 @@ class WeightSyncWorkerExtension:
 
     # Set to the imported vLLM private-API handles after the first successful guard check.
     _moe_conversion_api = None
+    _layerwise_reload_api = None
 
     def init_communicator(self, host: str, port: int, world_size: int, client_device_uuid: str) -> None:
         """
@@ -159,14 +171,215 @@ class WeightSyncWorkerExtension:
             self.communicator.broadcast(weight, src=self.client_rank)
             self.communicator.group.barrier()
 
-        # Load the received weights into the model. Fused (packed 3D) MoE expert tensors need
+        # Load the received weights into the model.
+        #
+        # Layerwise (quantized) rounds: between begin_weight_update() and end_weight_update()
+        # the model's parameters are restored to checkpoint layout and every weight loader is
+        # wrapped by vLLM's layerwise reload machinery (deferred per-layer re-processing, with
+        # results copied back into the original kernel-format storage). Tensors arrive in
+        # checkpoint format (e.g. fp8 weight + `*_scale_inv` scales) and are routed through the
+        # ordinary `load_weights`; packed 3D expert tensors are sliced into per-expert
+        # checkpoint keys first.
+        #
+        # Non-layerwise rounds (unquantized models): fused (packed 3D) MoE expert tensors need
         # special handling: unquantized MoE backends such as FlashInfer TRT-LLM re-lay-out the
         # expert weight parameters into a kernel block format after the bulk startup load, and an
         # incremental `load_weights` against such a converted parameter crashes the engine core
         # (FlashInfer TRT-LLM) or silently corrupts the weights (FlashInfer CUTLASS). See
         # monorepo docs/vllm-flashinfer-moe-weight-sync.md.
-        if not self._maybe_update_fused_expert_param(name, weight):
+        if self._layerwise_update_active:
+            self._load_checkpoint_format_tensor(name, weight)
+        elif not self._maybe_update_fused_expert_param(name, weight):
             self.model_runner.model.load_weights(weights=[(name, weight)])
+
+    @classmethod
+    def _get_layerwise_reload_api(cls):
+        """Import and guard vLLM's layerwise reload machinery (private API).
+
+        Validated against vllm==0.25.0: `record_metadata_for_reloading` is called at model
+        construction (model_loader/utils.py), so standard-layout metadata is always available;
+        `initialize_layerwise_reload` restores checkpoint-layout params with wrapped loaders;
+        `finalize_layerwise_processing` re-runs per-layer quantization processing (e.g.
+        Fp8MoEMethod/Fp8LinearMethod process_weights_after_loading, FlashInfer TRT-LLM
+        kernel-format shuffles) and copies results into the original tensor storage, keeping
+        captured CUDA graphs valid. This is the same call sequence as
+        GPUModelRunner.reload_weights (gpu_model_runner.py), driven from the RL sync protocol
+        instead of a checkpoint iterator.
+        """
+        if cls._layerwise_reload_api is not None:
+            return cls._layerwise_reload_api
+
+        guard_msg = (
+            "WeightSyncWorkerExtension: vLLM's layerwise reload API changed (validated on "
+            "vllm==0.25.0). Re-validate the quantized weight-update path against this vLLM "
+            "version before syncing (a broken reload corrupts every subsequent rollout). "
+        )
+        try:
+            from vllm.model_executor.model_loader.reload.layerwise import (
+                finalize_layerwise_processing,
+                initialize_layerwise_reload,
+            )
+        except ImportError as e:
+            raise RuntimeError(guard_msg + f"Import failed: {e}") from e
+
+        import inspect
+
+        init_params = list(inspect.signature(initialize_layerwise_reload).parameters)
+        finalize_params = list(inspect.signature(finalize_layerwise_processing).parameters)
+        if init_params != ["model"] or finalize_params != ["model", "model_config"]:
+            raise RuntimeError(
+                guard_msg
+                + f"Signatures changed: initialize={init_params}, finalize={finalize_params}."
+            )
+
+        cls._layerwise_reload_api = (initialize_layerwise_reload, finalize_layerwise_processing)
+        return cls._layerwise_reload_api
+
+    def get_server_quantization(self) -> str | None:
+        """Return the server model's quantization method (e.g. "fp8"), or None.
+
+        The sync client uses this to decide whether to send checkpoint-format quantized
+        tensors (weight + scale pairs inside a begin/end layerwise round) or plain bf16.
+        """
+        quantization = getattr(self.model_runner.model_config, "quantization", None)
+        return str(quantization) if quantization is not None else None
+
+    def begin_weight_update(self) -> None:
+        """Arm vLLM's layerwise reload for a full checkpoint-format weight-update round.
+
+        Only valid for quantized models. After this call the model is NOT runnable until
+        end_weight_update(): every layer's parameters are restored to checkpoint layout on
+        the meta device and re-materialize as their weights stream in.
+        """
+        if self._layerwise_update_active:
+            raise RuntimeError("begin_weight_update called while a weight update is already active.")
+        self._guard_no_full_cudagraphs()
+        initialize_layerwise_reload, _ = self._get_layerwise_reload_api()
+        initialize_layerwise_reload(self.model_runner.model)
+        self._layerwise_update_active = True
+
+    def _guard_no_full_cudagraphs(self) -> None:
+        """Refuse layerwise weight updates under FULL CUDA graphs.
+
+        Empirically (vllm==0.25.0, tiny DeepSeek-V3.2 fp8, B300): after a layerwise
+        reload round, every parameter/buffer is value- AND address-stable, eager and
+        PIECEWISE-graph outputs are bitwise identical to pre-round, but captured
+        FULL-decode graphs produce different (deterministic, wrong) outputs - the
+        finalize step rebuilds quantized MoE kernels (`Fp8MoEMethod._setup_kernel`)
+        and the full graph keeps stale internal state. Fail loudly instead of
+        corrupting rollouts; serve with `--cudagraph-mode PIECEWISE` (or
+        `--enforce-eager True`) for RL sync against quantized models.
+        """
+        try:
+            compilation_config = self.model_runner.vllm_config.compilation_config
+            mode = compilation_config.cudagraph_mode
+        except AttributeError as e:
+            raise RuntimeError(
+                "WeightSyncWorkerExtension: could not inspect the CUDA graph mode "
+                f"(vLLM internals changed: {e}). Re-validate layerwise weight updates "
+                "against this vLLM version."
+            ) from e
+        has_full = getattr(mode, "has_full_cudagraphs", None)
+        full_active = has_full() if callable(has_full) else "FULL" in str(mode)
+        if full_active:
+            raise RuntimeError(
+                f"Layerwise weight updates are unsafe under CUDA graph mode {mode}: "
+                "captured FULL graphs keep stale quantized-kernel state after the "
+                "post-update kernel rebuild (validated on vllm==0.25.0). Launch the "
+                "server with --cudagraph-mode PIECEWISE or --enforce-eager True."
+            )
+
+    def end_weight_update(self) -> None:
+        """Finalize a layerwise weight-update round: process remaining layers and restore
+        kernel formats (per-layer quantization post-processing + copy-back)."""
+        if not self._layerwise_update_active:
+            raise RuntimeError("end_weight_update called without begin_weight_update.")
+        _, finalize_layerwise_processing = self._get_layerwise_reload_api()
+        try:
+            finalize_layerwise_processing(self.model_runner.model, self.model_runner.model_config)
+        finally:
+            self._layerwise_update_active = False
+
+    def _load_checkpoint_format_tensor(self, name: str, weight) -> None:
+        """Route one checkpoint-format tensor through load_weights during a layerwise round.
+
+        Packed 3D expert tensors (weights or `_scale_inv` block scales) are sliced into
+        per-expert checkpoint keys first, since models like DeepSeek only map per-expert
+        names; everything else goes through load_weights directly. Loading nothing is an
+        error for weights but tolerated for auxiliary tensors vLLM does not use.
+        """
+        model = self.model_runner.model
+        match = self._PACKED_EXPERT_ANY_RE.match(name)
+        if match is not None and weight.dim() == 3:
+            pairs = self._packed_expert_checkpoint_pairs(
+                name, weight, match.group("proj"), is_scale=match.group("scale") is not None
+            )
+            loaded = set()
+            for ckpt_key, tensor_2d in pairs:
+                loaded |= set(model.load_weights(weights=[(ckpt_key, tensor_2d)]) or ())
+            if not loaded:
+                raise RuntimeError(
+                    f"Layerwise weight update for '{name}' loaded nothing via per-expert keys."
+                )
+            return
+        try:
+            loaded = model.load_weights(weights=[(name, weight)])
+        except KeyError:
+            loaded = None  # unknown name: models may raise instead of skipping
+        if not loaded:
+            logging.getLogger(__name__).warning(
+                "Layerwise weight update: '%s' did not map onto the model; skipped.", name
+            )
+
+    def _packed_expert_checkpoint_pairs(
+        self, name: str, weight, proj: str, is_scale: bool, hidden_size: int | None = None
+    ):
+        """Slice a packed 3D expert tensor into (checkpoint key, 2D tensor) pairs.
+
+        Handles both the weight tensors (`[E, 2I, H]` gate-first / `[E, H, I]`, linear
+        convention) and their block-scale companions (same layout divided by the 128-block
+        in both trailing dims). Orientation is inferred against the model's hidden size
+        (scaled by the block size for `_scale_inv` tensors); ambiguity raises.
+        """
+        import math as _math
+
+        if hidden_size is None:
+            hidden_size = self.model_runner.model_config.hf_text_config.hidden_size
+        hidden = _math.ceil(hidden_size / 128) if is_scale else hidden_size
+        base = name.rsplit(".", 1)[0]
+        suffix = "weight_scale_inv" if is_scale else "weight"
+        _, dim1, dim2 = weight.shape
+
+        pairs = []
+        for expert_id in range(weight.shape[0]):
+            if proj == "gate_up_proj":
+                if dim2 == hidden and dim1 != hidden:  # [E, 2I, H] rows-first
+                    intermediate = dim1 // 2
+                    gate = weight[expert_id, :intermediate, :]
+                    up = weight[expert_id, intermediate:, :]
+                elif dim1 == hidden and dim2 != hidden:  # [E, H, 2I] transposed
+                    intermediate = dim2 // 2
+                    gate = weight[expert_id, :, :intermediate].t().contiguous()
+                    up = weight[expert_id, :, intermediate:].t().contiguous()
+                else:
+                    raise RuntimeError(
+                        f"Cannot infer packed gate_up orientation for '{name}': shape "
+                        f"{tuple(weight.shape)} vs hidden {hidden} (is_scale={is_scale})."
+                    )
+                pairs.append((f"{base}.{expert_id}.gate_proj.{suffix}", gate))
+                pairs.append((f"{base}.{expert_id}.up_proj.{suffix}", up))
+            else:
+                if dim1 == hidden and dim2 != hidden:  # [E, H, I]
+                    down = weight[expert_id, :, :]
+                elif dim2 == hidden and dim1 != hidden:  # [E, I, H] transposed
+                    down = weight[expert_id, :, :].t().contiguous()
+                else:
+                    raise RuntimeError(
+                        f"Cannot infer packed down orientation for '{name}': shape "
+                        f"{tuple(weight.shape)} vs hidden {hidden} (is_scale={is_scale})."
+                    )
+                pairs.append((f"{base}.{expert_id}.down_proj.{suffix}", down))
+        return pairs
 
     @classmethod
     def _get_moe_conversion_api(cls):
@@ -378,61 +591,33 @@ class WeightSyncWorkerExtension:
           disk convention) are transposed per expert before loading.
         A shape that matches neither (or is ambiguous, `H == 2I` / `H == I`) raises.
         """
-        loaded = self.model_runner.model.load_weights(weights=[(name, weight)])
+        try:
+            loaded = self.model_runner.model.load_weights(weights=[(name, weight)])
+        except KeyError:
+            # Models without a packed-3D loader may raise on the unknown name (e.g.
+            # deepseek_v2.py's final params_dict[name] lookup) instead of skipping it.
+            loaded = None
         if loaded:
             return True
 
-        hidden = layer.hidden_size
-        num_global_experts = weight.shape[0]
-        base = name.rsplit(".", 1)[0]  # "...mlp.experts"
-        _, dim1, dim2 = weight.shape
-
-        def per_expert_slices(expert_id: int) -> list[tuple[str, str, "torch.Tensor"]]:
-            """Return [(checkpoint key, shard id, 2D tensor in checkpoint convention)]."""
-            if proj == "gate_up_proj":
-                if dim2 == hidden and dim1 != hidden:  # [E, 2I, H], linear convention
-                    intermediate = dim1 // 2
-                    gate = weight[expert_id, :intermediate, :]
-                    up = weight[expert_id, intermediate:, :]
-                elif dim1 == hidden and dim2 != hidden:  # [E, H, 2I], transposed
-                    intermediate = dim2 // 2
-                    gate = weight[expert_id, :, :intermediate].t().contiguous()
-                    up = weight[expert_id, :, intermediate:].t().contiguous()
-                else:
-                    raise RuntimeError(
-                        f"Cannot infer packed gate_up_proj orientation for '{name}': shape "
-                        f"{tuple(weight.shape)} with hidden_size {hidden} is ambiguous or mismatched."
-                    )
-                return [
-                    (f"{base}.{expert_id}.gate_proj.weight", "w1", gate),
-                    (f"{base}.{expert_id}.up_proj.weight", "w3", up),
-                ]
-            else:  # down_proj
-                if dim1 == hidden and dim2 != hidden:  # [E, H, I], linear convention
-                    down = weight[expert_id, :, :]
-                elif dim2 == hidden and dim1 != hidden:  # [E, I, H], transposed
-                    down = weight[expert_id, :, :].t().contiguous()
-                else:
-                    raise RuntimeError(
-                        f"Cannot infer packed down_proj orientation for '{name}': shape "
-                        f"{tuple(weight.shape)} with hidden_size {hidden} is ambiguous or mismatched."
-                    )
-                return [(f"{base}.{expert_id}.down_proj.weight", "w2", down)]
-
+        shard_ids = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
+        expert_key_re = re.compile(r"\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
         any_loaded = False
-        for expert_id in range(num_global_experts):
-            for ckpt_key, shard_id, tensor_2d in per_expert_slices(expert_id):
-                # Under EP, experts not owned by this rank return success=False; that is
-                # expected and must not fail the sync (mirrors load_weights' skip).
-                success = layer.weight_loader(
-                    staging,
-                    tensor_2d,
-                    ckpt_key,
-                    shard_id=shard_id,
-                    expert_id=expert_id,
-                    return_success=True,
-                )
-                any_loaded = any_loaded or bool(success)
+        for ckpt_key, tensor_2d in self._packed_expert_checkpoint_pairs(
+            name, weight, proj, is_scale=False, hidden_size=layer.hidden_size
+        ):
+            key_match = expert_key_re.search(ckpt_key)
+            # Under EP, experts not owned by this rank return success=False; that is
+            # expected and must not fail the sync (mirrors load_weights' skip).
+            success = layer.weight_loader(
+                staging,
+                tensor_2d,
+                ckpt_key,
+                shard_id=shard_ids[key_match.group(2)],
+                expert_id=int(key_match.group(1)),
+                return_success=True,
+            )
+            any_loaded = any_loaded or bool(success)
         return any_loaded
 
     def close_communicator(self) -> None:
@@ -577,6 +762,15 @@ class ScriptArguments:
             "hardware support this feature."
         },
     )
+    cudagraph_mode: str | None = field(
+        default=None,
+        metadata={
+            "help": "vLLM CUDA graph mode override (e.g. 'PIECEWISE', 'FULL_AND_PIECEWISE', 'NONE'), forwarded via "
+            "compilation_config. REQUIRED to be 'PIECEWISE' (or serve with --enforce-eager) when running RL weight "
+            "sync against a quantized (fp8) model: layerwise weight updates leave captured FULL graphs with stale "
+            "quantized-kernel state (validated on vllm==0.25.0); begin_weight_update refuses FULL-graph servers."
+        },
+    )
     enable_expert_parallel: bool | None = field(
         default=None,
         metadata={
@@ -673,6 +867,8 @@ def llm_worker(
     # Optional engine args: only forward when explicitly set, so vLLM's config validation never
     # sees `None` where it expects a bool/dict and engine defaults are preserved otherwise.
     optional_engine_kwargs = {}
+    if script_args.cudagraph_mode is not None:
+        optional_engine_kwargs["compilation_config"] = {"cudagraph_mode": script_args.cudagraph_mode}
     if script_args.enable_expert_parallel is not None:
         optional_engine_kwargs["enable_expert_parallel"] = script_args.enable_expert_parallel
     if script_args.moe_backend is not None:
@@ -1534,6 +1730,46 @@ def main(script_args: ScriptArguments):
         all_outputs = [connection.recv() for connection in connections]
         success = all(output for output in all_outputs)
         return {"message": "Request received, resetting prefix cache status: " + str(success)}
+
+    @app.get("/get_server_quantization/")
+    async def get_server_quantization():
+        """
+        Returns the served model's quantization method (e.g. "fp8"), or null for an
+        unquantized model. The sync client uses this to decide between the plain bf16
+        per-tensor sync and the checkpoint-format layerwise round (weight + scale pairs
+        inside begin/end_weight_update).
+        """
+        kwargs = {"method": "get_server_quantization"}
+        connections[0].send({"type": "call", "method": "collective_rpc", "kwargs": kwargs})
+        output = connections[0].recv()
+        quantization = output[0] if isinstance(output, list) and output else None
+        return {"quantization": quantization}
+
+    @app.post("/begin_weight_update/")
+    async def begin_weight_update():
+        """
+        Arms vLLM's layerwise reload on every worker for a full checkpoint-format weight
+        update (quantized models). The model is unrunnable until /end_weight_update/.
+        """
+        kwargs = {"method": "begin_weight_update"}
+        for connection in connections:
+            connection.send({"type": "call", "method": "collective_rpc", "kwargs": kwargs})
+        for connection in connections:
+            connection.recv()
+        return {"message": "Layerwise weight update armed"}
+
+    @app.post("/end_weight_update/")
+    async def end_weight_update():
+        """
+        Finalizes a layerwise weight update on every worker: re-runs per-layer quantization
+        processing and restores kernel formats.
+        """
+        kwargs = {"method": "end_weight_update"}
+        for connection in connections:
+            connection.send({"type": "call", "method": "collective_rpc", "kwargs": kwargs})
+        for connection in connections:
+            connection.recv()
+        return {"message": "Layerwise weight update finalized"}
 
     @app.post("/close_communicator/")
     async def close_communicator():

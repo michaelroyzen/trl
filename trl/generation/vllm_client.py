@@ -726,6 +726,37 @@ class VLLMClient:
         if response.status_code != 200:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
+    def get_server_quantization(self) -> str | None:
+        """
+        Returns the served model's quantization method (e.g. `"fp8"`), or `None` when the
+        server holds unquantized weights. Decides which sync path `sync_weights` uses.
+        """
+        url = f"{self.base_url}/get_server_quantization/"
+        response = self.session.get(url)
+        if response.status_code != 200:
+            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+        return response.json().get("quantization")
+
+    def begin_weight_update(self):
+        """
+        Arms the server's layerwise reload for a full checkpoint-format weight update
+        (quantized serving). The server model is unrunnable until `end_weight_update`.
+        """
+        url = f"{self.base_url}/begin_weight_update/"
+        response = self.session.post(url)
+        if response.status_code != 200:
+            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+
+    def end_weight_update(self):
+        """
+        Finalizes a layerwise weight update round on the server (re-runs quantization
+        kernel-format processing per layer).
+        """
+        url = f"{self.base_url}/end_weight_update/"
+        response = self.session.post(url)
+        if response.status_code != 200:
+            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+
     def close_communicator(self):
         """
         Closes the weight update group and cleans up the communication group.
