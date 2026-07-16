@@ -317,7 +317,7 @@ class WeightSyncWorkerExtension:
         # standard-layout local shard into it, then restore the original parameter.
         setattr(layer, target_name, staging)
         try:
-            loaded = self.model_runner.model.load_weights(weights=[(name, weight)])
+            loaded = self._load_packed_expert_tensor(name, weight, layer, staging, proj)
         finally:
             setattr(layer, target_name, param)
         if not loaded:
@@ -353,6 +353,87 @@ class WeightSyncWorkerExtension:
             )
         # Copy into the original storage so data_ptr stays stable for captured CUDA graphs.
         param.data.copy_(converted)
+
+    def _load_packed_expert_tensor(self, name: str, weight, layer, staging, proj: str) -> bool:
+        """Load a packed 3D expert tensor into the (swapped-in) staging parameter.
+
+        Preferred path: the model's own `load_weights`, for vLLM models with a native
+        packed-3D loader (e.g. qwen3_5's `load_fused_expert_weights` — transformers-5
+        checkpoints for those models ship packed tensors, so vLLM handles the layout,
+        gate/up split, EP expert mapping and TP narrowing).
+
+        Fallback path: models whose vLLM implementation only understands per-expert 2D
+        checkpoint names (e.g. DeepSeek-V3.2: `deepseek_v2.py` has no packed-3D handling,
+        so `load_weights` returns nothing for `...experts.gate_up_proj`). The packed
+        tensor is sliced per expert into checkpoint-convention 2D tensors and driven
+        through the layer's expert-aware `weight_loader` (shard ids w1/w3/w2), which is
+        exactly what `load_weights` would do per checkpoint key - reusing vLLM's
+        validated EP mapping and TP narrowing rather than reimplementing them.
+
+        Orientation is detected from the wire shape (in-memory transformers layout):
+        - deepseek_v32 trainers sync `nn.functional.linear` convention:
+          `gate_up [E, 2I, H]` (gate rows first), `down [E, H, I]` - matching the
+          per-expert checkpoint convention directly after slicing.
+        - transposed layouts (`gate_up [E, H, 2I]` / `down [E, I, H]`, the qwen3_5
+          disk convention) are transposed per expert before loading.
+        A shape that matches neither (or is ambiguous, `H == 2I` / `H == I`) raises.
+        """
+        loaded = self.model_runner.model.load_weights(weights=[(name, weight)])
+        if loaded:
+            return True
+
+        hidden = layer.hidden_size
+        num_global_experts = weight.shape[0]
+        base = name.rsplit(".", 1)[0]  # "...mlp.experts"
+        _, dim1, dim2 = weight.shape
+
+        def per_expert_slices(expert_id: int) -> list[tuple[str, str, "torch.Tensor"]]:
+            """Return [(checkpoint key, shard id, 2D tensor in checkpoint convention)]."""
+            if proj == "gate_up_proj":
+                if dim2 == hidden and dim1 != hidden:  # [E, 2I, H], linear convention
+                    intermediate = dim1 // 2
+                    gate = weight[expert_id, :intermediate, :]
+                    up = weight[expert_id, intermediate:, :]
+                elif dim1 == hidden and dim2 != hidden:  # [E, H, 2I], transposed
+                    intermediate = dim2 // 2
+                    gate = weight[expert_id, :, :intermediate].t().contiguous()
+                    up = weight[expert_id, :, intermediate:].t().contiguous()
+                else:
+                    raise RuntimeError(
+                        f"Cannot infer packed gate_up_proj orientation for '{name}': shape "
+                        f"{tuple(weight.shape)} with hidden_size {hidden} is ambiguous or mismatched."
+                    )
+                return [
+                    (f"{base}.{expert_id}.gate_proj.weight", "w1", gate),
+                    (f"{base}.{expert_id}.up_proj.weight", "w3", up),
+                ]
+            else:  # down_proj
+                if dim1 == hidden and dim2 != hidden:  # [E, H, I], linear convention
+                    down = weight[expert_id, :, :]
+                elif dim2 == hidden and dim1 != hidden:  # [E, I, H], transposed
+                    down = weight[expert_id, :, :].t().contiguous()
+                else:
+                    raise RuntimeError(
+                        f"Cannot infer packed down_proj orientation for '{name}': shape "
+                        f"{tuple(weight.shape)} with hidden_size {hidden} is ambiguous or mismatched."
+                    )
+                return [(f"{base}.{expert_id}.down_proj.weight", "w2", down)]
+
+        any_loaded = False
+        for expert_id in range(num_global_experts):
+            for ckpt_key, shard_id, tensor_2d in per_expert_slices(expert_id):
+                # Under EP, experts not owned by this rank return success=False; that is
+                # expected and must not fail the sync (mirrors load_weights' skip).
+                success = layer.weight_loader(
+                    staging,
+                    tensor_2d,
+                    ckpt_key,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                    return_success=True,
+                )
+                any_loaded = any_loaded or bool(success)
+        return any_loaded
 
     def close_communicator(self) -> None:
         """
