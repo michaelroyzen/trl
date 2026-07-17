@@ -115,7 +115,10 @@ Three commits, each independently validated:
   (written by the monorepo's `dequantize_fp8_checkpoint.py`): the original
   checkpoint's fp8 weight keys, i.e. exactly what to re-quantize.
 - fp8 rollout servers MUST run `--cudagraph-mode PIECEWISE` (enforced at
-  `begin_weight_update`).
+  `begin_weight_update`). Measured cost on the 671B (8x B300, TP8+EP, 256-token
+  decodes): -25% throughput at 256 concurrent sequences vs default FULL graphs
+  (-58% at 32, -73% at 4 - DeepSeek-V3.2 decode is heavily launch-bound). Size
+  rollout concurrency accordingly, or fix FULL-graph recapture upstream.
 - MTP / speculative decoding stays off for RL sync (drafter weights are never synced).
 - As before: any server-side sync exception wedges the weight-update group; restart
   the server before retrying.
