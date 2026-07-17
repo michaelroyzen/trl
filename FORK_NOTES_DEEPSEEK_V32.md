@@ -51,8 +51,13 @@ Three commits, each independently validated:
   **ambiguous shapes raise**. This matters: a test model with `2I == H` failed here by
   design; keep `moe_intermediate_size * 2 != hidden_size` in test fixtures.
 - Validated live (tiny arch-faithful server, FlashInfer TRT-LLM bf16 MoE backend,
-  default CUDA graphs): identity sync bitwise-preserves greedy ids + logprobs;
-  zero/restore of `lm_head` and packed `gate_up_proj` shift and recover exactly.
+  default FULL_AND_PIECEWISE CUDA graphs - FULL decode capture confirmed in logs):
+  identity sync bitwise-preserves greedy ids + logprobs; zero/restore of `lm_head`
+  and packed `gate_up_proj` shift and recover exactly. Since those probes decode
+  through the FULL graph, this proves bf16+FULL is sync-safe: the staging path's
+  `param.data.copy_` into original storage means captured graphs both stay valid AND
+  observe the synced weights. Only the fp8 layerwise path (which rebuilds the MoE
+  kernel in finalize) needs PIECEWISE.
   CPU tests: `tests/test_fused_expert_weight_sync.py` (19, incl. a bitwise round-trip
   on real checkpoint expert tensors when `DS32_SNAPSHOT` is available).
 
