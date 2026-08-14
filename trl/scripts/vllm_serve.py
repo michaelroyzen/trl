@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import os
+import re
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -46,6 +47,19 @@ class WeightSyncWorkerExtension:
     # The following attributes are initialized when `init_communicator` method is called.
     communicator = None  # Communicator for weight updates
     client_rank = None  # Source rank for broadcasting updated weights
+
+    # Fused (packed 3D) MoE expert tensors, e.g. `...mlp.experts.gate_up_proj` for Qwen3.5-MoE.
+    _FUSED_EXPERT_WEIGHT_RE = re.compile(r"(?P<module>.+\.experts)\.(?P<proj>gate_up_proj|down_proj)$")
+
+    # Unquantized MoE backends whose kernel-format conversion is validated to be an independent,
+    # per-tensor transformation of w13 and w2 (see `_update_fused_expert_param`). AITER (ROCm) is
+    # deliberately excluded until validated.
+    _SUPPORTED_UNQUANTIZED_MOE_BACKENDS = frozenset(
+        {"FLASHINFER_TRTLLM", "FLASHINFER_CUTLASS", "TRITON", "BATCHED_TRITON"}
+    )
+
+    # Set to the imported vLLM private-API handles after the first successful guard check.
+    _moe_conversion_api = None
 
     def init_communicator(self, host: str, port: int, world_size: int, client_device_uuid: str) -> None:
         """
@@ -145,8 +159,200 @@ class WeightSyncWorkerExtension:
             self.communicator.broadcast(weight, src=self.client_rank)
             self.communicator.group.barrier()
 
-        # Load the received weights into the model.
-        self.model_runner.model.load_weights(weights=[(name, weight)])
+        # Load the received weights into the model. Fused (packed 3D) MoE expert tensors need
+        # special handling: unquantized MoE backends such as FlashInfer TRT-LLM re-lay-out the
+        # expert weight parameters into a kernel block format after the bulk startup load, and an
+        # incremental `load_weights` against such a converted parameter crashes the engine core
+        # (FlashInfer TRT-LLM) or silently corrupts the weights (FlashInfer CUTLASS). See
+        # monorepo docs/vllm-flashinfer-moe-weight-sync.md.
+        if not self._maybe_update_fused_expert_param(name, weight):
+            self.model_runner.model.load_weights(weights=[(name, weight)])
+
+    @classmethod
+    def _get_moe_conversion_api(cls):
+        """Import and guard the private vLLM MoE kernel-format conversion API.
+
+        `_update_fused_expert_param` relies on vLLM internals that are not a stable API. This
+        guard was validated against vllm==0.25.0 and fails loudly (rather than corrupting
+        weights silently) if a vLLM upgrade changes the surface.
+        """
+        if cls._moe_conversion_api is not None:
+            return cls._moe_conversion_api
+
+        import inspect
+
+        guard_msg = (
+            "WeightSyncWorkerExtension: vLLM's private MoE kernel-format conversion API changed "
+            "(validated on vllm==0.25.0). Re-validate the fused-expert weight sync path against "
+            "this vLLM version (see docs/vllm-flashinfer-moe-weight-sync.md). "
+        )
+        try:
+            from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import FusedMoEModularMethod
+            from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
+                convert_to_unquantized_kernel_format,
+            )
+            from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+                UnquantizedFusedMoEMethod,
+            )
+            from vllm.model_executor.utils import set_weight_attrs
+        except ImportError as e:
+            raise RuntimeError(guard_msg + f"Import failed: {e}") from e
+
+        expected_params = ["unquantized_backend", "moe_config", "w13_weight", "w2_weight"]
+        actual_params = list(inspect.signature(convert_to_unquantized_kernel_format).parameters)
+        if actual_params != expected_params:
+            raise RuntimeError(
+                guard_msg
+                + f"convert_to_unquantized_kernel_format signature changed: expected {expected_params}, "
+                + f"got {actual_params}."
+            )
+
+        cls._moe_conversion_api = (
+            FusedMoEModularMethod,
+            UnquantizedFusedMoEMethod,
+            convert_to_unquantized_kernel_format,
+            set_weight_attrs,
+        )
+        return cls._moe_conversion_api
+
+    def _maybe_update_fused_expert_param(self, name: str, weight) -> bool:
+        """Route a fused (packed 3D) MoE expert tensor through the staging + re-conversion path.
+
+        Returns `True` if the tensor was handled here, `False` if the caller should fall back to
+        the plain `model.load_weights` path (dense tensors, quantized MoE methods, unknown name
+        forms, or a model without a matching MoE module).
+        """
+        if weight.dim() != 3:
+            return False
+        match = self._FUSED_EXPERT_WEIGHT_RE.match(name)
+        if match is None:
+            return False
+
+        model = self.model_runner.model
+        try:
+            experts_module = model.get_submodule(match.group("module"))
+        except AttributeError:
+            return False
+        # The `.experts` attribute is a MoERunner in vLLM >= 0.25; the expert weight parameters
+        # live on its RoutedExperts child. Older layouts keep them on the module itself.
+        layer = getattr(experts_module, "routed_experts", experts_module)
+        if not (hasattr(layer, "w13_weight") and hasattr(layer, "w2_weight") and hasattr(layer, "quant_method")):
+            return False
+
+        FusedMoEModularMethod, UnquantizedFusedMoEMethod, _, _ = self._get_moe_conversion_api()
+        quant_method = layer.quant_method
+        if isinstance(quant_method, FusedMoEModularMethod):
+            quant_method = quant_method.old_quant_method
+        if not isinstance(quant_method, UnquantizedFusedMoEMethod):
+            # Quantized MoE methods manage their own weight layouts; keep the legacy behavior.
+            return False
+        if quant_method.moe_kernel is None:
+            # Weights have not been kernel-format converted yet; the plain path is still valid.
+            return False
+
+        backend = quant_method.unquantized_backend
+        if backend.name not in self._SUPPORTED_UNQUANTIZED_MOE_BACKENDS:
+            raise NotImplementedError(
+                f"Fused expert weight sync is not supported for unquantized MoE backend "
+                f"'{backend.name}' (tensor '{name}'). Supported backends: "
+                f"{sorted(self._SUPPORTED_UNQUANTIZED_MOE_BACKENDS)}."
+            )
+
+        self._update_fused_expert_param(name, weight, layer, quant_method, match.group("proj"))
+        logging.getLogger(__name__).debug(
+            "Synced fused expert tensor '%s' via staging + %s kernel-format re-conversion.",
+            name,
+            backend.name,
+        )
+        return True
+
+    def _update_fused_expert_param(self, name: str, weight, layer, quant_method, proj: str) -> None:
+        """Update one fused expert tensor on a (possibly kernel-format-converted) FusedMoE layer.
+
+        The full unsharded checkpoint-form tensor (`gate_up_proj [E, hidden, 2*intermediate]` or
+        `down_proj [E, intermediate, hidden]`) arrives on every worker. Mirroring how the bulk
+        startup load works, this:
+
+        1. Registers a standard-layout staging parameter (the shape `create_weights` produces:
+           `w13 [E_local, 2I_part, H]` / `w2 [E_local, H, I_part]`) in place of the converted
+           parameter and routes the tensor through `model.load_weights`, so vLLM's validated
+           fused-expert loader handles the transpose, gate/up split, expert mapping (EP) and TP
+           sharding.
+        2. Re-runs vLLM's kernel-format conversion (`convert_to_unquantized_kernel_format`) on
+           the staged tensor and copies the result into the original parameter storage, keeping
+           tensor addresses stable so captured CUDA graphs remain valid. The w13/w2 conversions
+           are independent per-tensor permutations for the supported backends, so the counterpart
+           parameter is never touched; its slot is fed a discarded dummy tensor.
+
+        Under backends without a kernel-format conversion (e.g. Triton) this degrades to plain
+        copies through the same code path.
+        """
+        import torch
+
+        _, _, convert_to_unquantized_kernel_format, set_weight_attrs = self._get_moe_conversion_api()
+
+        target_name = "w13_weight" if proj == "gate_up_proj" else "w2_weight"
+        param = getattr(layer, target_name)
+
+        # Standard-layout shapes, mirroring UnquantizedFusedMoEMethod.create_weights.
+        moe_config = layer.moe_config
+        num_local_experts = moe_config.num_local_experts
+        intermediate = moe_config.intermediate_size_per_partition
+        hidden = layer.hidden_size
+        w13_up_dim = 2 * intermediate if moe_config.is_act_and_mul else intermediate
+        w13_shape = (num_local_experts, w13_up_dim, hidden)
+        w2_shape = (num_local_experts, hidden, intermediate)
+
+        staging = torch.nn.Parameter(
+            torch.empty(
+                w13_shape if target_name == "w13_weight" else w2_shape,
+                dtype=layer.params_dtype,
+                device=param.device,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(staging, {"weight_loader": layer.weight_loader})
+
+        # Temporarily swap the staging parameter in so the regular load path writes the
+        # standard-layout local shard into it, then restore the original parameter.
+        setattr(layer, target_name, staging)
+        try:
+            loaded = self.model_runner.model.load_weights(weights=[(name, weight)])
+        finally:
+            setattr(layer, target_name, param)
+        if not loaded:
+            raise RuntimeError(
+                f"Fused expert weight sync for '{name}' did not load any weights into the "
+                "staging tensor; the weight name does not map onto the model as expected."
+            )
+
+        # Convert the staged tensor to the backend's kernel format. The counterpart slot gets a
+        # dummy tensor whose converted output is discarded (conversions are per-tensor).
+        dummy = torch.empty(
+            w2_shape if target_name == "w13_weight" else w13_shape,
+            dtype=layer.params_dtype,
+            device=param.device,
+        )
+        if target_name == "w13_weight":
+            w13_new, _ = convert_to_unquantized_kernel_format(
+                quant_method.unquantized_backend, moe_config=moe_config, w13_weight=staging.data, w2_weight=dummy
+            )
+            converted = w13_new
+        else:
+            _, w2_new = convert_to_unquantized_kernel_format(
+                quant_method.unquantized_backend, moe_config=moe_config, w13_weight=dummy, w2_weight=staging.data
+            )
+            converted = w2_new
+
+        if converted.shape != param.data.shape or converted.dtype != param.data.dtype:
+            raise RuntimeError(
+                f"Fused expert weight sync for '{name}': kernel-format conversion produced "
+                f"{converted.dtype} {tuple(converted.shape)} but the parameter storage is "
+                f"{param.data.dtype} {tuple(param.data.shape)}. Refusing to write (this would "
+                "corrupt the model); re-validate against this vLLM version."
+            )
+        # Copy into the original storage so data_ptr stays stable for captured CUDA graphs.
+        param.data.copy_(converted)
 
     def close_communicator(self) -> None:
         """
@@ -195,6 +401,17 @@ class ScriptArguments:
         enable_prefix_caching (`bool`, *optional*):
             Whether to enable prefix caching in vLLM. If set to `True`, ensure that the model and the hardware support
             this feature.
+        enable_expert_parallel (`bool`, *optional*):
+            Whether to enable expert parallelism in vLLM for MoE models. If set to `True`, experts will be distributed
+            across tensor parallel workers.
+        moe_backend (`str`, *optional*):
+            MoE kernel backend override, forwarded to vLLM's `--moe-backend` engine arg (e.g. `"triton"`,
+            `"flashinfer_trtllm"`). When unset, vLLM selects a backend automatically. RL weight sync requires a
+            backend that keeps expert weights in the standard layout (e.g. `"triton"`): backends that re-lay-out
+            expert weights into kernel block formats after loading crash on incremental expert-weight updates.
+        gdn_prefill_backend (`str`, *optional*):
+            GDN prefill kernel backend override, forwarded to vLLM's `--gdn-prefill-backend` engine arg (e.g.
+            `"triton"`, `"flashinfer"`, `"cutedsl"`). When unset, vLLM selects a backend automatically.
         enforce_eager (`bool`, *optional*, defaults to `False`):
             Whether to enforce eager execution. If set to `True`, we will disable CUDA graph and always execute the
             model in eager mode. If `False` (default behavior), we will use CUDA graph and eager execution in hybrid.
@@ -207,6 +424,12 @@ class ScriptArguments:
         trust_remote_code (`bool`, *optional*, defaults to `False`):
             Whether to trust remote code when loading models. Set to `True` to allow executing code from model
             repositories. This is required for some custom models but introduces security risks.
+        language_model_only (`bool`, *optional*, defaults to `False`):
+            Whether to force vLLM to load the model in language-model-only mode. Disables all multimodal inputs by
+            setting every modality limit to 0, so a multimodal checkpoint serves as a text-only model.
+        limit_mm_per_prompt (`str`, *optional*):
+            Limits on multimodal items per prompt, as comma-separated key=value pairs (e.g., `"image=0,video=0"`).
+            Passed through to vLLM's EngineArgs to restrict the number of multimodal inputs.
         log_level (`str`, *optional*, defaults to `"info"`):
             Log level for uvicorn. Possible choices: `"critical"`, `"error"`, `"warning"`, `"info"`, `"debug"`,
             `"trace"`.
@@ -276,6 +499,28 @@ class ScriptArguments:
             "hardware support this feature."
         },
     )
+    enable_expert_parallel: bool | None = field(
+        default=None,
+        metadata={
+            "help": "Whether to enable expert parallelism in vLLM for MoE models. If set to `True`, experts will "
+            "be distributed across tensor parallel workers."
+        },
+    )
+    moe_backend: str | None = field(
+        default=None,
+        metadata={
+            "help": "MoE kernel backend override, forwarded to vLLM's `--moe-backend` engine arg (e.g. 'triton', "
+            "'flashinfer_trtllm'). When unset, vLLM selects a backend automatically. RL weight sync requires a "
+            "backend that keeps expert weights in the standard layout (e.g. 'triton')."
+        },
+    )
+    gdn_prefill_backend: str | None = field(
+        default=None,
+        metadata={
+            "help": "GDN prefill kernel backend override, forwarded to vLLM's `--gdn-prefill-backend` engine arg "
+            "(e.g. 'triton', 'flashinfer', 'cutedsl'). When unset, vLLM selects a backend automatically."
+        },
+    )
     enforce_eager: bool | None = field(
         default=False,
         metadata={
@@ -295,6 +540,20 @@ class ScriptArguments:
         metadata={
             "help": "Whether to trust remote code when loading models. Set to True to allow executing code from model "
             "repositories. This is required for some custom models but introduces security risks."
+        },
+    )
+    language_model_only: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to force vLLM to load the model in language-model-only mode. Disables all multimodal "
+            "inputs by setting every modality limit to 0, so a multimodal checkpoint serves as a text-only model."
+        },
+    )
+    limit_mm_per_prompt: str | None = field(
+        default=None,
+        metadata={
+            "help": "Limits on multimodal items per prompt, as comma-separated key=value pairs "
+            "(e.g., 'image=0,video=0'). Passed through to vLLM's EngineArgs."
         },
     )
     log_level: str = field(
@@ -340,6 +599,24 @@ def llm_worker(
     os.environ["VLLM_DP_SIZE"] = str(script_args.data_parallel_size)
     os.environ["VLLM_DP_MASTER_PORT"] = str(master_port)
 
+    # Optional engine args: only forward when explicitly set, so vLLM's config validation never
+    # sees `None` where it expects a bool/dict and engine defaults are preserved otherwise.
+    optional_engine_kwargs = {}
+    if script_args.enable_expert_parallel is not None:
+        optional_engine_kwargs["enable_expert_parallel"] = script_args.enable_expert_parallel
+    if script_args.moe_backend is not None:
+        optional_engine_kwargs["moe_backend"] = script_args.moe_backend
+    if script_args.gdn_prefill_backend is not None:
+        optional_engine_kwargs["gdn_prefill_backend"] = script_args.gdn_prefill_backend
+    if script_args.language_model_only:
+        optional_engine_kwargs["language_model_only"] = True
+    if script_args.limit_mm_per_prompt:
+        limit_mm_per_prompt = {}
+        for item in script_args.limit_mm_per_prompt.split(","):
+            key, value = item.split("=")
+            limit_mm_per_prompt[key.strip()] = int(value.strip())
+        optional_engine_kwargs["limit_mm_per_prompt"] = limit_mm_per_prompt
+
     llm = LLM(
         model=script_args.model,
         revision=script_args.revision,
@@ -360,6 +637,7 @@ def llm_worker(
         # Important so temperature scaling/logit tweaking affects the TIS log probs
         logprobs_mode="processed_logprobs",
         speculative_config=json.loads(script_args.speculative_config) if script_args.speculative_config else None,
+        **optional_engine_kwargs,
     )
 
     # Send ready signal to parent process
