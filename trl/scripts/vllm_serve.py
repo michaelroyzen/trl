@@ -409,6 +409,9 @@ class ScriptArguments:
             `"flashinfer_trtllm"`). When unset, vLLM selects a backend automatically. RL weight sync requires a
             backend that keeps expert weights in the standard layout (e.g. `"triton"`): backends that re-lay-out
             expert weights into kernel block formats after loading crash on incremental expert-weight updates.
+        gdn_prefill_backend (`str`, *optional*):
+            GDN prefill kernel backend override, forwarded to vLLM's `--gdn-prefill-backend` engine arg (e.g.
+            `"triton"`, `"flashinfer"`, `"cutedsl"`). When unset, vLLM selects a backend automatically.
         enforce_eager (`bool`, *optional*, defaults to `False`):
             Whether to enforce eager execution. If set to `True`, we will disable CUDA graph and always execute the
             model in eager mode. If `False` (default behavior), we will use CUDA graph and eager execution in hybrid.
@@ -511,6 +514,13 @@ class ScriptArguments:
             "backend that keeps expert weights in the standard layout (e.g. 'triton')."
         },
     )
+    gdn_prefill_backend: str | None = field(
+        default=None,
+        metadata={
+            "help": "GDN prefill kernel backend override, forwarded to vLLM's `--gdn-prefill-backend` engine arg "
+            "(e.g. 'triton', 'flashinfer', 'cutedsl'). When unset, vLLM selects a backend automatically."
+        },
+    )
     enforce_eager: bool | None = field(
         default=False,
         metadata={
@@ -596,6 +606,8 @@ def llm_worker(
         optional_engine_kwargs["enable_expert_parallel"] = script_args.enable_expert_parallel
     if script_args.moe_backend is not None:
         optional_engine_kwargs["moe_backend"] = script_args.moe_backend
+    if script_args.gdn_prefill_backend is not None:
+        optional_engine_kwargs["gdn_prefill_backend"] = script_args.gdn_prefill_backend
     if script_args.language_model_only:
         optional_engine_kwargs["language_model_only"] = True
     if script_args.limit_mm_per_prompt:
