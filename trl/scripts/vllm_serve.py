@@ -19,19 +19,124 @@ import logging
 import math
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from io import BytesIO
 from itertools import chain
 from multiprocessing import Pipe, Process
 from multiprocessing.connection import Connection
+from typing import Any
 
 
 # We use CUDA with multiprocessing, so we must use the 'spawn' start method. Otherwise, we will get the following
 # error: RuntimeError: Cannot re-initialize CUDA in forked subprocess. To use CUDA with multiprocessing, you must use
 # the 'spawn' start method
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+logger = logging.getLogger(__name__)
+
+# Environment variables through which vLLM's offline ("SPMD") data parallelism is configured. Only the MoE path sets
+# them; the dense path must not inherit them (see `configure_worker_env`).
+_VLLM_DP_ENV_VARS = ("VLLM_DP_RANK", "VLLM_DP_RANK_LOCAL", "VLLM_DP_SIZE", "VLLM_DP_MASTER_IP", "VLLM_DP_MASTER_PORT")
+
+# Set by `configure_worker_env` for dense data-parallel ranks and read by `WeightSyncWorkerExtension.init_communicator`
+# (which runs inside vLLM's worker processes and inherits this environment).
+WEIGHT_SYNC_RANK_OFFSET_ENV = "TRL_WEIGHT_SYNC_RANK_OFFSET"
+
+# Config attributes that declare routed experts, across the MoE families vLLM recognizes (Qwen-MoE / Mixtral / Llama4
+# / DeepSeek / GLM-MoE ...). Mirrors what vLLM's `ModelConfig.get_num_experts` inspects.
+_MOE_EXPERT_COUNT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
+
+
+def config_declares_experts(config: Any) -> bool:
+    """Whether a `PretrainedConfig` (or its text sub-config) declares a positive number of routed experts."""
+    text_config = config.get_text_config() if hasattr(config, "get_text_config") else config
+    candidates = [text_config] if text_config is config else [text_config, config]
+    for candidate in candidates:
+        for key in _MOE_EXPERT_COUNT_KEYS:
+            value = getattr(candidate, key, None)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return True
+    return False
+
+
+def is_moe_model(model: str, revision: str | None = None, trust_remote_code: bool = False) -> bool:
+    """Whether the checkpoint is a mixture-of-experts model, judged from its config alone.
+
+    Mirrors vLLM's `ModelConfig.is_moe` (`num_experts > 0`), which is what decides whether vLLM accepts offline data
+    parallelism. Defaults to `False` (dense) when the config cannot be loaded: the dense path runs standalone engines,
+    which is also a valid (if expert-parallel-less) way to serve an MoE, whereas treating a dense model as MoE
+    reproduces vLLM's "Offline data parallel mode is not supported/useful for dense models" error.
+    """
+    from transformers import AutoConfig
+
+    try:
+        config = AutoConfig.from_pretrained(model, revision=revision, trust_remote_code=trust_remote_code)
+    except Exception as exc:  # noqa: BLE001 - any config failure falls back to the dense path
+        logger.warning("Could not load the config of %s to detect MoE (%s); assuming a dense model.", model, exc)
+        return False
+    return config_declares_experts(config)
+
+
+def configure_worker_env(
+    environ: MutableMapping[str, str],
+    *,
+    data_parallel_rank: int,
+    data_parallel_size: int,
+    tensor_parallel_size: int,
+    master_port: int,
+    moe: bool,
+) -> None:
+    """Prepare a data-parallel worker's environment before its vLLM engine is created.
+
+    MoE models use vLLM's offline data parallelism: every rank sets `VLLM_DP_*` and vLLM builds lockstep
+    `DPEngineCoreProc`s that coordinate expert-parallel collectives across ranks. That path is unchanged.
+
+    Dense models cannot use it: vLLM (PR #30739, shipped in 0.25.0) rejects env-var data parallelism for models without
+    experts, because dense ranks need no coordination at all. So each dense rank runs a standalone tensor-parallel
+    engine pinned to its own slice of `CUDA_VISIBLE_DEVICES` (rank `r` gets devices `[r * tp, (r + 1) * tp)` of the
+    visible list) while the parent process keeps sharding prompts across ranks exactly as before. A standalone engine's
+    world group covers only its own tensor-parallel workers, so `TRL_WEIGHT_SYNC_RANK_OFFSET` (= `r * tp`) is
+    published for `WeightSyncWorkerExtension.init_communicator` to keep ranks unique inside the `tp * dp + 1` weight
+    update group the trainer sizes.
+
+    Must run before anything initializes CUDA in the worker process.
+    """
+    if moe:
+        # Set required environment variables for DP to work with vLLM
+        environ["VLLM_DP_RANK"] = str(data_parallel_rank)
+        environ["VLLM_DP_RANK_LOCAL"] = str(data_parallel_rank)
+        environ["VLLM_DP_SIZE"] = str(data_parallel_size)
+        environ["VLLM_DP_MASTER_PORT"] = str(master_port)
+        return
+
+    # Inherited VLLM_DP_* would re-enter vLLM's DP path (and shift its worker->GPU mapping on top of our slice).
+    for key in _VLLM_DP_ENV_VARS:
+        environ.pop(key, None)
+
+    visible = environ.get("CUDA_VISIBLE_DEVICES", "")
+    if visible:
+        devices = [device.strip() for device in visible.split(",") if device.strip()]
+    else:
+        devices = [str(i) for i in range(tensor_parallel_size * data_parallel_size)]
+    start = data_parallel_rank * tensor_parallel_size
+    shard = devices[start : start + tensor_parallel_size]
+    if len(shard) != tensor_parallel_size:
+        raise RuntimeError(
+            f"Dense data-parallel rank {data_parallel_rank} needs {tensor_parallel_size} GPUs (visible devices "
+            f"{start}..{start + tensor_parallel_size - 1}) but CUDA_VISIBLE_DEVICES={devices} only provides {shard}. "
+            f"tensor_parallel_size * data_parallel_size = {tensor_parallel_size * data_parallel_size} GPUs must be "
+            "visible to the server."
+        )
+    environ["CUDA_VISIBLE_DEVICES"] = ",".join(shard)
+    environ[WEIGHT_SYNC_RANK_OFFSET_ENV] = str(start)
+
+
+def weight_sync_rank_offset(environ: Mapping[str, str] | None = None) -> int:
+    """Rank offset for the weight update group, `0` unless `configure_worker_env` set one for a dense DP rank."""
+    environ = os.environ if environ is None else environ
+    return int(environ.get(WEIGHT_SYNC_RANK_OFFSET_ENV, "0"))
 
 
 class WeightSyncWorkerExtension:
@@ -105,8 +210,11 @@ class WeightSyncWorkerExtension:
                     "roles/ranks within the same communicator. This setup is unsupported and will likely lead to program "
                     "hangs or incorrect behavior. Ensure that trainer is using different devices than vLLM server."
                 )
-        # Get the rank of the current worker in the global world group.
-        rank = get_world_group().rank
+        # Get the rank of the current worker in the global world group. Under vLLM's own data parallelism (MoE path)
+        # that group spans every DP x TP worker, so the rank is already unique. Dense DP ranks are standalone engines
+        # whose world group is only their own TP workers, so `configure_worker_env` publishes a
+        # `data_parallel_rank * tensor_parallel_size` offset that keeps the rank unique across engines.
+        rank = get_world_group().rank + weight_sync_rank_offset()
 
         if is_torch_xpu_available():
             store = torch.distributed.TCPStore(host_name=host, port=port, world_size=world_size, is_master=(rank == 0))
@@ -380,8 +488,11 @@ class ScriptArguments:
         tensor_parallel_size (`int`, *optional*, defaults to `1`):
             Number of tensor parallel workers to use.
         data_parallel_size (`int`, *optional*, defaults to `1`):
-            Number of data parallel workers to use. For dense models, keep this at 1. Setting this above `1` for dense
-            models is not supported/useful and will error out (see vLLM PR #30739).
+            Number of data parallel workers to use. MoE models use vLLM's offline data parallelism (lockstep engines
+            sharing expert-parallel collectives). Dense models, which vLLM refuses to run that way (PR #30739), get one
+            standalone tensor-parallel engine per rank on its own slice of `CUDA_VISIBLE_DEVICES` (rank `r` uses
+            visible devices `[r * tp, (r + 1) * tp)`), so `tensor_parallel_size * data_parallel_size` GPUs must be
+            visible. Prompts are sharded across ranks in both cases.
         host (`str`, *optional*, defaults to `"0.0.0.0"`):
             Host address to run the server on.
         port (`int`, *optional*, defaults to `8000`):
@@ -456,8 +567,9 @@ class ScriptArguments:
     data_parallel_size: int = field(
         default=1,
         metadata={
-            "help": "Number of data parallel workers to use. For dense models, keep this at 1. Setting this above "
-            "`1` for dense models is not supported/useful and will error out (see vLLM PR #30739)."
+            "help": "Number of data parallel workers to use. MoE models use vLLM's offline data parallelism; dense "
+            "models get one standalone tensor-parallel engine per rank on its own slice of CUDA_VISIBLE_DEVICES, so "
+            "tensor_parallel_size * data_parallel_size GPUs must be visible."
         },
     )
     host: str = field(
@@ -589,15 +701,28 @@ class ScriptArguments:
 
 
 def llm_worker(
-    script_args: ScriptArguments, data_parallel_rank: int, master_port: int, connection: Connection
+    script_args: ScriptArguments,
+    data_parallel_rank: int,
+    master_port: int,
+    connection: Connection,
+    moe: bool | None = None,
 ) -> None:
-    from vllm import LLM
+    if moe is None:
+        moe = is_moe_model(script_args.model, script_args.revision, script_args.trust_remote_code)
 
-    # Set required environment variables for DP to work with vLLM
-    os.environ["VLLM_DP_RANK"] = str(data_parallel_rank)
-    os.environ["VLLM_DP_RANK_LOCAL"] = str(data_parallel_rank)
-    os.environ["VLLM_DP_SIZE"] = str(script_args.data_parallel_size)
-    os.environ["VLLM_DP_MASTER_PORT"] = str(master_port)
+    # Must precede any CUDA initialization in this (freshly spawned) process: for dense models this pins the engine
+    # to this rank's slice of CUDA_VISIBLE_DEVICES; for MoE models it sets the VLLM_DP_* variables vLLM's data
+    # parallelism reads. vLLM's engine-core and tensor-parallel worker subprocesses inherit the result.
+    configure_worker_env(
+        os.environ,
+        data_parallel_rank=data_parallel_rank,
+        data_parallel_size=script_args.data_parallel_size,
+        tensor_parallel_size=script_args.tensor_parallel_size,
+        master_port=master_port,
+        moe=moe,
+    )
+
+    from vllm import LLM
 
     # Optional engine args: only forward when explicitly set, so vLLM's config validation never
     # sees `None` where it expects a bool/dict and engine defaults are preserved otherwise.
@@ -728,11 +853,25 @@ def main(script_args: ScriptArguments):
 
     # Spawn dp workers, and setup pipes for communication
     master_port = get_open_port()
+    # Detect MoE once here rather than in every worker; see `configure_worker_env` for how the two kinds of model are
+    # data-parallelized.
+    moe = is_moe_model(script_args.model, script_args.revision, script_args.trust_remote_code)
+    if script_args.data_parallel_size > 1:
+        logger.info(
+            "Data parallelism: %d x TP=%d %s",
+            script_args.data_parallel_size,
+            script_args.tensor_parallel_size,
+            "lockstep vLLM DP engines (MoE model)"
+            if moe
+            else "standalone engines on disjoint CUDA_VISIBLE_DEVICES slices (dense model)",
+        )
     connections = []
     processes = []
     for data_parallel_rank in range(script_args.data_parallel_size):
         parent_connection, child_connection = Pipe()
-        process = Process(target=llm_worker, args=(script_args, data_parallel_rank, master_port, child_connection))
+        process = Process(
+            target=llm_worker, args=(script_args, data_parallel_rank, master_port, child_connection, moe)
+        )
         process.start()
         connections.append(parent_connection)
         processes.append(process)
