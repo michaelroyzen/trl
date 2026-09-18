@@ -99,7 +99,8 @@ def configure_worker_env(
     visible list) while the parent process keeps sharding prompts across ranks exactly as before. A standalone engine's
     world group covers only its own tensor-parallel workers, so `TRL_WEIGHT_SYNC_RANK_OFFSET` (= `r * tp`) is
     published for `WeightSyncWorkerExtension.init_communicator` to keep ranks unique inside the `tp * dp + 1` weight
-    update group the trainer sizes.
+    update group the trainer sizes. Each engine also gets its own `VLLM_CACHE_ROOT` (`<root>/dense_dp_rank_<r>`) so
+    that identical engines never write the same torch.compile cache files concurrently.
 
     Must run before anything initializes CUDA in the worker process.
     """
@@ -131,6 +132,23 @@ def configure_worker_env(
         )
     environ["CUDA_VISIBLE_DEVICES"] = ",".join(shard)
     environ[WEIGHT_SYNC_RANK_OFFSET_ENV] = str(start)
+
+    if data_parallel_size > 1:
+        # vLLM keys its torch.compile cache by `<config hash>/rank_<tp_rank>_<dp_index>/`. Standalone engines all
+        # have dp index 0 and identical configs, so without this their same-rank workers would write the same cache
+        # files concurrently (plain, unlocked writes) on a cold start. Give each engine its own cache root instead.
+        environ["VLLM_CACHE_ROOT"] = os.path.join(
+            default_vllm_cache_root(environ), f"dense_dp_rank_{data_parallel_rank}"
+        )
+
+
+def default_vllm_cache_root(environ: Mapping[str, str] | None = None) -> str:
+    """vLLM's cache root as vLLM itself resolves it: `$VLLM_CACHE_ROOT`, else `$XDG_CACHE_HOME/vllm`, else `~/.cache/vllm`."""
+    environ = os.environ if environ is None else environ
+    root = environ.get("VLLM_CACHE_ROOT")
+    if not root:
+        root = os.path.join(environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"), "vllm")
+    return os.path.expanduser(root)
 
 
 def weight_sync_rank_offset(environ: Mapping[str, str] | None = None) -> int:
