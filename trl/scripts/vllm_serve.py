@@ -48,6 +48,25 @@ WEIGHT_SYNC_RANK_OFFSET_ENV = "TRL_WEIGHT_SYNC_RANK_OFFSET"
 # / DeepSeek / GLM-MoE ...). Mirrors what vLLM's `ModelConfig.get_num_experts` inspects.
 _MOE_EXPERT_COUNT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
 
+# Width of the TCP port window each standalone dense engine may allocate from (see `dense_engine_port_base`).
+PORTS_PER_DENSE_ENGINE = 100
+
+
+def dense_engine_port_base(master_port: int, data_parallel_rank: int) -> int:
+    """First port of the disjoint window a dense data-parallel engine allocates its TCP ports from.
+
+    vLLM allocates the port for an engine's tensor-parallel process group with `get_open_port()`: bind, release, and
+    bind again seconds later inside the workers. Standalone engines that start simultaneously can therefore draw the
+    same free port and the second one dies with `EADDRINUSE` (vLLM only retries this in its own data-parallel path).
+    With `VLLM_PORT` set, vLLM instead scans upward from that port for a free one, so every engine gets its own
+    window: `master_port` (a free port the parent found) offset by `PORTS_PER_DENSE_ENGINE * rank`, wrapping into a
+    low range if that would run past the port space.
+    """
+    base = master_port + PORTS_PER_DENSE_ENGINE * data_parallel_rank
+    if base + PORTS_PER_DENSE_ENGINE > 65535:
+        base = 10000 + PORTS_PER_DENSE_ENGINE * data_parallel_rank
+    return base
+
 
 def config_declares_experts(config: Any) -> bool:
     """Whether a `PretrainedConfig` (or its text sub-config) declares a positive number of routed experts."""
@@ -100,7 +119,8 @@ def configure_worker_env(
     world group covers only its own tensor-parallel workers, so `TRL_WEIGHT_SYNC_RANK_OFFSET` (= `r * tp`) is
     published for `WeightSyncWorkerExtension.init_communicator` to keep ranks unique inside the `tp * dp + 1` weight
     update group the trainer sizes. Each engine also gets its own `VLLM_CACHE_ROOT` (`<root>/dense_dp_rank_<r>`) so
-    that identical engines never write the same torch.compile cache files concurrently.
+    that identical engines never write the same torch.compile cache files concurrently, and its own `VLLM_PORT`
+    window so that they never race for the same process-group port (see `dense_engine_port_base`).
 
     Must run before anything initializes CUDA in the worker process.
     """
@@ -140,6 +160,8 @@ def configure_worker_env(
         environ["VLLM_CACHE_ROOT"] = os.path.join(
             default_vllm_cache_root(environ), f"dense_dp_rank_{data_parallel_rank}"
         )
+        # Disjoint TCP port windows, so simultaneously starting engines cannot race for the same process-group port.
+        environ["VLLM_PORT"] = str(dense_engine_port_base(master_port, data_parallel_rank))
 
 
 def default_vllm_cache_root(environ: Mapping[str, str] | None = None) -> str:
@@ -149,6 +171,17 @@ def default_vllm_cache_root(environ: Mapping[str, str] | None = None) -> str:
     if not root:
         root = os.path.join(environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"), "vllm")
     return os.path.expanduser(root)
+
+
+def check_dense_dp_supported(script_args: Any, moe: bool) -> None:
+    """Reject launch configurations the standalone-engine dense path cannot honor."""
+    if moe or script_args.data_parallel_size <= 1:
+        return
+    if script_args.distributed_executor_backend == "ray":
+        raise ValueError(
+            "Dense data parallelism runs one standalone engine per rank on a slice of CUDA_VISIBLE_DEVICES, which "
+            "the ray executor ignores. Use the default multiprocessing executor, or data_parallel_size=1 with ray."
+        )
 
 
 def weight_sync_rank_offset(environ: Mapping[str, str] | None = None) -> int:
@@ -874,6 +907,7 @@ def main(script_args: ScriptArguments):
     # Detect MoE once here rather than in every worker; see `configure_worker_env` for how the two kinds of model are
     # data-parallelized.
     moe = is_moe_model(script_args.model, script_args.revision, script_args.trust_remote_code)
+    check_dense_dp_supported(script_args, moe)
     if script_args.data_parallel_size > 1:
         logger.info(
             "Data parallelism: %d x TP=%d %s",

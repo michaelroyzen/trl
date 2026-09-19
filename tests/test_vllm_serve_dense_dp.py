@@ -22,6 +22,7 @@ monorepo (start `trl vllm-serve --tensor-parallel-size 4 --data-parallel-size 2`
 `/get_world_size/ == 8` and one `update_named_param` round trip).
 """
 
+import itertools
 import os
 import sys
 import types
@@ -35,12 +36,15 @@ import transformers
 
 import trl.import_utils as trl_import_utils
 from trl.scripts.vllm_serve import (
+    PORTS_PER_DENSE_ENGINE,
     WEIGHT_SYNC_RANK_OFFSET_ENV,
     ScriptArguments,
     WeightSyncWorkerExtension,
+    check_dense_dp_supported,
     config_declares_experts,
     configure_worker_env,
     default_vllm_cache_root,
+    dense_engine_port_base,
     is_moe_model,
     llm_worker,
     weight_sync_rank_offset,
@@ -186,6 +190,18 @@ class TestConfigureWorkerEnv:
         )
         assert env["VLLM_CACHE_ROOT"] == "/scratch/vllm/dense_dp_rank_1"
 
+    def test_dense_ranks_get_disjoint_port_windows(self):
+        ports = [
+            int(
+                self._configure(
+                    {"CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}, rank, tp=2, dp=4, moe=False, master_port=40000
+                )["VLLM_PORT"]
+            )
+            for rank in range(4)
+        ]
+        assert ports == [40000, 40100, 40200, 40300]
+        assert all(b - a >= PORTS_PER_DENSE_ENGINE for a, b in itertools.pairwise(ports))
+
     def test_dense_raises_when_too_few_gpus_are_visible(self):
         with pytest.raises(RuntimeError, match="needs 4 GPUs"):
             self._configure({"CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5"}, 1, tp=4, dp=2, moe=False)
@@ -202,6 +218,43 @@ class TestConfigureWorkerEnv:
         }
         assert WEIGHT_SYNC_RANK_OFFSET_ENV not in env
         assert "VLLM_CACHE_ROOT" not in env
+        assert "VLLM_PORT" not in env
+
+
+class TestDenseEnginePortBase:
+    def test_windows_are_disjoint_and_start_at_master_port(self):
+        bases = [dense_engine_port_base(50000, r) for r in range(8)]
+        assert bases == [50000 + PORTS_PER_DENSE_ENGINE * r for r in range(8)]
+
+    def test_wraps_into_low_range_near_the_top_of_port_space(self):
+        bases = [dense_engine_port_base(65500, r) for r in range(3)]
+        assert bases == [10000, 10100, 10200]
+        assert all(b + PORTS_PER_DENSE_ENGINE <= 65535 for b in bases)
+
+    def test_only_ranks_that_would_overflow_wrap(self):
+        # rank 0 fits below 65535, rank 1 would not
+        assert dense_engine_port_base(65400, 0) == 65400
+        assert dense_engine_port_base(65400, 1) == 10000 + PORTS_PER_DENSE_ENGINE
+
+
+class TestCheckDenseDpSupported:
+    def test_rejects_ray_executor_for_dense_dp(self):
+        args = ScriptArguments(
+            model="m", tensor_parallel_size=2, data_parallel_size=2, distributed_executor_backend="ray"
+        )
+        with pytest.raises(ValueError, match="ray executor"):
+            check_dense_dp_supported(args, moe=False)
+
+    @pytest.mark.parametrize(
+        "kwargs, moe",
+        [
+            ({"data_parallel_size": 2}, False),  # default mp executor
+            ({"data_parallel_size": 1, "distributed_executor_backend": "ray"}, False),  # TP-only with ray is fine
+            ({"data_parallel_size": 2, "distributed_executor_backend": "ray"}, True),  # MoE path is vLLM's own DP
+        ],
+    )
+    def test_accepts_supported_configurations(self, kwargs, moe):
+        check_dense_dp_supported(ScriptArguments(model="m", tensor_parallel_size=2, **kwargs), moe=moe)
 
 
 class TestDefaultVllmCacheRoot:
@@ -333,6 +386,7 @@ class TestLlmWorkerWiring:
         assert env["CUDA_VISIBLE_DEVICES"] == "2,3"
         assert env[WEIGHT_SYNC_RANK_OFFSET_ENV] == "2"
         assert env["VLLM_CACHE_ROOT"].endswith("/dense_dp_rank_1")
+        assert env["VLLM_PORT"] == str(dense_engine_port_base(51000, 1))
         assert not any(key in env for key in VLLM_DP_KEYS)
         kwargs = constructed["kwargs"]
         assert kwargs["tensor_parallel_size"] == 2
@@ -357,6 +411,7 @@ class TestLlmWorkerWiring:
         }
         assert WEIGHT_SYNC_RANK_OFFSET_ENV not in env
         assert "VLLM_CACHE_ROOT" not in env
+        assert "VLLM_PORT" not in env
         assert constructed["kwargs"]["tensor_parallel_size"] == 2
         assert sent == [{"status": "ready"}]
 
